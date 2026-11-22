@@ -1,6 +1,6 @@
 # 本地项目文件 MCP
 
-用 Go 编写的本地文件 MCP 服务，使用官方 MCP Go SDK 和 Streamable HTTP。启动时通过 `-root` 指定唯一允许访问的目录，可通过 gost 转发至服务器的 HTTPS 端点，供 Gemini 网页版的自定义应用使用。
+用 Go 编写的本地文件 MCP 服务，使用官方 MCP Go SDK 和 Streamable HTTP。启动时通过 `-root` 指定唯一允许访问的目录，可通过 gost 转发至服务器的 HTTPS 端点，供 Gemini 网页版的自定义应用使用。支持内置 gost v3 relay 客户端，无需单独运行 gost 客户端进程。
 
 ## 编译和启动
 
@@ -58,6 +58,41 @@ Gemini 网页版的认证使用下方内置 OAuth，无需另装认证网关。�
 部署后应验证 OAuth 授权、受保护的文件操作及公网转发。
 
 默认只接受 `https://gemini.google.com` 这个 Origin，同时允许没有 Origin 的服务端请求。额外的 Origin 可通过 `-allowed-origins` 用逗号分隔传入。此检查用于阻止其他网页直接调用，不替代身份认证；本程序不提供浏览器跨域 CORS 接口。
+
+### 内置 gost v3 客户端
+
+通过 `-gost-config` 读取仓库外的 gost v3 JSON 客户端配置，即可将远端端口映射到本机 MCP。远端仍运行 gost v3 服务端和 nginx；nginx 的上游继续指向原来的远端绑定端口。
+
+```text
+nginx → 远端绑定端口 → gost relay 隧道 → 本机 MCP
+                         ↑
+           MCP 内置客户端主动连接，可经过 SOCKS5
+```
+
+参考 [gost-relay.example.json](deploy/gost-relay.example.json)，先复制到仓库外的私密目录后填写实际参数，目录权限设为 `700`、文件权限设为 `600`。示例中的 `services[0].addr` 是远端 gost 服务器上的绑定地址，`forwarder.nodes[0].addr` 必须与 MCP 的 `-listen` 完全一致。已有配置满足下述范围时可直接复用，无需复制凭据。
+
+```bash
+./bin/local-files-mcp -root /srv/my-project \
+  -listen 127.0.0.1:8765 \
+  -gost-config "$HOME/dev/.local-files-mcp/my-project/gost.json" \
+  -check-gost-config
+
+./bin/local-files-mcp -root /srv/my-project \
+  -listen 127.0.0.1:8765 \
+  -gost-config "$HOME/dev/.local-files-mcp/my-project/gost.json" \
+  -oauth-issuer https://mcp.example.com \
+  -oauth-state "$HOME/dev/.local-files-mcp/my-project/oauth.json"
+```
+
+`-check-gost-config` 只检查配置和权限，不启动 HTTP、OAuth 或隧道，也不连接远端。未指定 `-gost-config` 时保持原有启动方式。
+
+支持范围：一个 `rtcp` 服务、一条链、每个 hop 一个节点，链路为 `relay` 或 `socks5 → relay`。SOCKS5 支持匿名或用户名口令认证；relay 支持用户名口令认证，`dialer.type` 支持 `tcp` 和 `tls`，多路复用默认使用 smux v1，可通过 relay connector 的 `metadata["mux.version"]` 设为 `2`，必须与服务端一致。无前置代理时删除示例中的 SOCKS5 hop。YAML、其他代理协议、WebSocket、UDP、多服务和节点池不在当前支持范围；未知字段及不支持的选项会被拒绝，避免默默忽略现有配置。
+
+Relay 本身不加密；TLS 通道使用 `dialer.type: "tls"`，可设置 `dialer.tls.serverName` 和 `dialer.tls.caFile`，始终校验服务器证书。CA 文件路径按进程工作目录解析。服务端需启用 [relay 的 BIND 功能](https://gost.run/tutorials/protocols/relay/)，例如 `gost -L 'relay://:8420?bind=true'`；实际部署按已有配置保留认证设置。
+
+隧道故障时本机 HTTP 服务继续运行，内置客户端按 1 至 30 秒退避重连；最多同时转发 128 条连接。退出时关闭隧道及转发连接。新增 relay 日志不输出地址、配置内容、用户名或口令，本机 `/healthz` 仅反映 HTTP 服务状态，不能代表远端映射是否可达。
+
+从独立 gost 客户端迁移时，先校验配置并给 MCP 的服务启动参数追加 `-gost-config`，再停止占用同一远端端口的旧客户端，重启 MCP 并检查远端转发。若旧 gost 进程还承担其他映射，不能整体停用。确认远端转发正常后再停用旧客户端的自动启动；整个过程无需重置 OAuth 状态或修改 nginx。
 
 ## 启用 Gemini OAuth
 
@@ -199,6 +234,8 @@ npx --yes @lint-md/cli --config ".lintmdrc" "README.md"
 ```
 
 测试覆盖目录越界、符号链接、硬链接写入、特殊文件、UTF-8、文件大小限制、并发版本检查、删除和移动、`.git` 保护、目标防覆盖，以及 HTTP 上的 MCP 初始化、工具发现和文件操作流程。OAuth 测试覆盖元数据发现、动态注册、密码与浏览器校验、PKCE、回调地址和资源绑定、授权码防重放、机密与公共客户端刷新、过期、持久化、撤销，以及访问令牌调用文件工具。
+
+Relay 测试覆盖配置隐私边界、协议限制、TLS 证书和口令校验、并行 HTTP 转发、断线重连及取消握手。可用 `LOCAL_FILES_MCP_TEST_GOST=/path/to/gost` 运行 `go test -race -run TestRelayGostV3Integration -v ./...`，使用指定的 gost v3 程序在临时端口启动合成 SOCKS5 和 relay 服务，验证真实协议互通及 MCP 认证；不读取生产配置，不连接生产账号。
 
 浏览器导航回归位于 `scripts/oauth-navigation-smoke.mjs`。先完成上述编译，再通过本机统一 Playwright 工具目录运行；脚本默认从仓库的 `bin/local-files-mcp` 启动合成服务，可用 `OAUTH_SMOKE_BINARY` 指定其他测试构建：
 

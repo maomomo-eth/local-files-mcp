@@ -3,7 +3,10 @@ module local-files-mcp
 go 1.25.0
 
 require (
+	github.com/go-gost/relay v0.7.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
+	github.com/xtaci/smux v1.5.57
+	golang.org/x/net v0.49.0
 	golang.org/x/sys v0.41.0
 	golang.org/x/time v0.15.0
 )

@@ -1,0 +1,48 @@
+{
+  "services": [
+    {
+      "name": "mcp-rtcp",
+      "addr": "127.0.0.1:18765",
+      "handler": { "type": "rtcp" },
+      "listener": { "type": "rtcp", "chain": "relay-chain" },
+      "forwarder": {
+        "nodes": [{ "name": "mcp", "addr": "127.0.0.1:8765" }]
+      }
+    }
+  ],
+  "chains": [
+    {
+      "name": "relay-chain",
+      "hops": [
+        {
+          "name": "proxy",
+          "nodes": [
+            {
+              "name": "socks5",
+              "addr": "127.0.0.1:1080",
+              "connector": { "type": "socks5" },
+              "dialer": { "type": "tcp" }
+            }
+          ]
+        },
+        {
+          "name": "relay",
+          "nodes": [
+            {
+              "name": "relay-server",
+              "addr": "mcp.example.com:8420",
+              "connector": {
+                "type": "relay",
+                "auth": {
+                  "username": "replace-with-username",
+                  "password": "replace-with-password"
+                }
+              },
+              "dialer": { "type": "tcp" }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

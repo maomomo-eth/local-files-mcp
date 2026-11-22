@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,8 @@ func run() error {
 	allowedOrigins := flag.String("allowed-origins", "https://gemini.google.com", "允许的 Origin，以逗号分隔；无 Origin 的服务端请求允许通过")
 	oauthIssuer := flag.String("oauth-issuer", "", "启用 Gemini OAuth，填写公网 HTTPS 域名根地址")
 	oauthStatePath := flag.String("oauth-state", "", "OAuth 私密状态文件，必须在项目目录外的权限为 700 的独立目录中")
+	gostConfigPath := flag.String("gost-config", "", "可选：项目目录外的 gost v3 JSON 配置，内置 rtcp/relay 客户端，支持前置 SOCKS5")
+	checkGostConfig := flag.Bool("check-gost-config", false, "仅校验 -gost-config 后退出，不启动 HTTP、OAuth 或隧道")
 	flag.Parse()
 	if *rootPath == "" {
 		return errors.New("必须通过 -root 指定允许访问的项目目录")
@@ -47,6 +50,20 @@ func run() error {
 	absRoot, err := filepath.Abs(*rootPath)
 	if err != nil {
 		return err
+	}
+	var relayCfg *relayConfig
+	if *checkGostConfig && *gostConfigPath == "" {
+		return errors.New("check-gost-config 需要同时指定 gost-config")
+	}
+	if *gostConfigPath != "" {
+		relayCfg, err = loadGostConfig(*gostConfigPath, absRoot, *listen)
+		if err != nil {
+			return err
+		}
+	}
+	if *checkGostConfig {
+		log.Print("gost 配置校验通过")
+		return nil
 	}
 	root, err := os.OpenRoot(absRoot)
 	if err != nil {
@@ -86,8 +103,20 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return err
+	}
 	done := make(chan error, 1)
-	go func() { done <- srv.ListenAndServe() }()
+	go func() { done <- srv.Serve(listener) }()
+	if relayCfg != nil {
+		relayDone := make(chan struct{})
+		go func() {
+			defer close(relayDone)
+			runRelay(ctx, relayCfg, relayLocalTarget(listener.Addr()))
+		}()
+		defer func() { stop(); <-relayDone }()
+	}
 	log.Printf("项目目录：%s；只读：%v；HTTP：%s；MCP 路径：/mcp", absRoot, *readOnly, *listen)
 	select {
 	case err := <-done:
