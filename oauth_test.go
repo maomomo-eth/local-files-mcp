@@ -312,8 +312,8 @@ func TestOAuthPersistenceExpiryAndPublicRotation(t *testing.T) {
 	}
 	defer a.close()
 	a.now = func() time.Time { return clock }
-	if !a.validAccess(out.Access) {
-		t.Fatal("重启丢失授权状态")
+	if a.validAccess(out.Access) {
+		t.Fatal("重启后重放撤销必须保持")
 	}
 	if _, err := openOAuth(testIssuer, f.path, f.p.root.Name(), false, ""); err == nil {
 		t.Fatal("同一状态文件不能被多个进程使用")

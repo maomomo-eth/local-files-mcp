@@ -131,15 +131,27 @@ func (a *oauthServer) register(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.cleanLocked()
 	if len(a.state.Clients) >= 256 {
 		oauthError(w, 429, "temporarily_unavailable", "客户端数量已达上限")
 		return
 	}
 	id, secret := rand.Text(), ""
-	c := oauthClient{Name: in.Name, Redirects: in.Redirects, Method: in.Method}
+	c := oauthClient{LastUsed: a.now(), Name: in.Name, Redirects: in.Redirects, Method: in.Method}
 	if in.Method != "none" {
 		secret = rand.Text()
 		c.SecretHash = hash([]byte(secret))
+	}
+	// 按实际 JSON 转义体积限制注册，为授权及令牌预留容量。
+	metadata := make(map[string]oauthClient, len(a.state.Clients)+1)
+	for k, v := range a.state.Clients {
+		metadata[k] = v
+	}
+	metadata[id] = c
+	encoded, _ := json.MarshalIndent(metadata, "", "  ")
+	if len(encoded) > maxClientMetadataBytes {
+		oauthError(w, 429, "temporarily_unavailable", "注册元数据容量已达上限")
+		return
 	}
 	if err := a.commitLocked(func() { a.state.Clients[id] = c }); err != nil {
 		oauthError(w, 500, "server_error", "客户端保存失败")
@@ -198,7 +210,13 @@ func (a *oauthServer) authorize(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 400, "invalid_scope", "仅支持 mcp 权限")
 		return
 	}
-	if len(q.Get("state")) > 2048 || len(a.pending) >= 128 {
+	clientPending := 0
+	for _, req := range a.pending {
+		if req.ClientID == q.Get("client_id") {
+			clientPending++
+		}
+	}
+	if len(q.Get("state")) > 2048 || len(a.pending) >= 128 || clientPending >= 4 {
 		oauthError(w, 429, "temporarily_unavailable", "授权请求过多")
 		return
 	}
@@ -253,13 +271,30 @@ func (a *oauthServer) consent(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 400, "invalid_request", "请选择授权或取消")
 		return
 	}
+	password := r.PostForm.Get("password")
+	if len(password) < 12 || len(password) > 1024 || req.Verifying {
+		oauthError(w, 403, "access_denied", "密码长度无效或请求正在验证")
+		return
+	}
 	if !a.loginLimit.Allow() {
 		w.Header().Set("Retry-After", "5")
 		oauthError(w, 429, "access_denied", "密码尝试过于频繁，请稍后重试")
 		return
 	}
-	password := r.PostForm.Get("password")
-	if len(password) > 1024 || !equalSecret(passwordHash(password, a.state.PasswordSalt), a.state.PasswordHash) {
+	req.Verifying = true
+	a.pending[id] = req
+	salt, expectedHash := a.state.PasswordSalt, a.state.PasswordHash
+	a.mu.Unlock()
+	computed := a.hashPassword(password, salt)
+	a.mu.Lock()
+	current, exists := a.pending[id]
+	if !exists || !a.now().Before(current.Expires) || !current.Verifying {
+		oauthError(w, 403, "access_denied", "授权请求已失效")
+		return
+	}
+	current.Verifying = false
+	a.pending[id] = current
+	if !equalSecret(computed, expectedHash) {
 		oauthError(w, 403, "access_denied", "授权密码错误，请返回重试")
 		return
 	}
@@ -386,7 +421,18 @@ func (a *oauthServer) token(w http.ResponseWriter, r *http.Request) {
 		grantID, refresh = rand.Text(), rand.Text()
 	case "refresh_token":
 		refresh = r.PostForm.Get("refresh_token")
-		t, exists := a.state.Tokens[hash([]byte(refresh))]
+		refreshKey := hash([]byte(refresh))
+		if used, found := a.state.Consumed[refreshKey]; found {
+			if g, ok := a.state.Grants[used.GrantID]; ok && g.ClientID == id {
+				if err := a.commitLocked(func() { a.revokeGrantLocked(used.GrantID) }); err != nil {
+					oauthError(w, 500, "server_error", "重放撤销保存失败")
+					return
+				}
+			}
+			oauthError(w, 400, "invalid_grant", "刷新令牌已消费，关联授权已撤销")
+			return
+		}
+		t, exists := a.state.Tokens[refreshKey]
 		g, grantExists := a.state.Grants[t.GrantID]
 		if !exists || !grantExists || t.Kind != "refresh" || g.ClientID != id || !now.Before(t.Expires) || !now.Before(g.Expires) {
 			oauthError(w, 400, "invalid_grant", "刷新令牌无效或已过期")
@@ -402,15 +448,19 @@ func (a *oauthServer) token(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 400, "unsupported_grant_type", "仅支持 authorization_code 和 refresh_token")
 		return
 	}
-	if len(a.state.Tokens) >= 2048 || len(a.state.Grants) >= 512 {
+	if len(a.state.Tokens) > 2046 || (codeKey != "" && len(a.state.Grants) >= 512) || (previousRefresh != "" && len(a.state.Consumed) >= maxConsumedTokens) {
 		oauthError(w, 429, "temporarily_unavailable", "令牌数量已达上限")
 		return
 	}
 	access := rand.Text()
 	expires := now.Add(90 * 24 * time.Hour)
 	if err := a.commitLocked(func() {
+		client := a.state.Clients[id]
+		client.LastUsed = now
+		a.state.Clients[id] = client
 		a.state.Grants[grantID] = oauthGrant{ClientID: id, Expires: expires}
 		if previousRefresh != "" {
+			a.state.Consumed[previousRefresh] = a.state.Tokens[previousRefresh]
 			delete(a.state.Tokens, previousRefresh)
 		}
 		a.state.Tokens[hash([]byte(access))] = oauthToken{GrantID: grantID, Kind: "access", Expires: now.Add(time.Hour)}
@@ -437,15 +487,13 @@ func (a *oauthServer) revoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t, ok := a.state.Tokens[hash([]byte(r.PostForm.Get("token")))]
+	if !ok {
+		t, ok = a.state.Consumed[hash([]byte(r.PostForm.Get("token")))]
+	}
 	g, grantOK := a.state.Grants[t.GrantID]
 	if ok && grantOK && g.ClientID == id {
 		if err := a.commitLocked(func() {
-			delete(a.state.Grants, t.GrantID)
-			for key, value := range a.state.Tokens {
-				if value.GrantID == t.GrantID {
-					delete(a.state.Tokens, key)
-				}
-			}
+			a.revokeGrantLocked(t.GrantID)
 		}); err != nil {
 			oauthError(w, 500, "server_error", "撤销保存失败")
 			return

@@ -20,12 +20,17 @@ import (
 
 const oauthScope = "mcp"
 const passwordIterations = 600000
+const maxOAuthStateBytes = 8 << 20
+const maxClientMetadataBytes = 2 << 20
+const clientIdleTTL = 7 * 24 * time.Hour
+const maxConsumedTokens = 4096
 
 type oauthClient struct {
-	Name       string   `json:"name"`
-	SecretHash string   `json:"secret_hash,omitempty"`
-	Method     string   `json:"method"`
-	Redirects  []string `json:"redirects"`
+	LastUsed   time.Time `json:"last_used,omitempty"`
+	Name       string    `json:"name"`
+	SecretHash string    `json:"secret_hash,omitempty"`
+	Method     string    `json:"method"`
+	Redirects  []string  `json:"redirects"`
 }
 type oauthGrant struct {
 	ClientID string    `json:"client_id"`
@@ -46,10 +51,12 @@ type oauthState struct {
 	Clients      map[string]oauthClient `json:"clients"`
 	Grants       map[string]oauthGrant  `json:"grants"`
 	Tokens       map[string]oauthToken  `json:"tokens"`
+	Consumed     map[string]oauthToken  `json:"consumed"`
 }
 type oauthRequest struct {
 	ClientID, Redirect, State, Challenge, CookieHash string
 	Expires                                          time.Time
+	Verifying                                        bool
 }
 type oauthServer struct {
 	issuer        string
@@ -63,6 +70,7 @@ type oauthServer struct {
 	loginLimit    *rate.Limiter
 	registerLimit *rate.Limiter
 	now           func() time.Time
+	hashPassword  func(string, string) string
 }
 
 func passwordHash(password, salt string) string {
@@ -119,7 +127,7 @@ func openOAuth(issuer, statePath, rootPath string, readOnly bool, password strin
 		lock.Close()
 		return fail(errors.New("OAuth 状态已被其他进程使用"))
 	}
-	a := &oauthServer{issuer: issuer, dir: dir, filename: filepath.Base(abs), lock: lock, pending: map[string]oauthRequest{}, codes: map[string]oauthRequest{}, loginLimit: rate.NewLimiter(rate.Every(5*time.Second), 5), registerLimit: rate.NewLimiter(rate.Every(3*time.Second), 20), now: time.Now}
+	a := &oauthServer{issuer: issuer, dir: dir, filename: filepath.Base(abs), lock: lock, pending: map[string]oauthRequest{}, codes: map[string]oauthRequest{}, loginLimit: rate.NewLimiter(rate.Every(5*time.Second), 5), registerLimit: rate.NewLimiter(rate.Every(3*time.Second), 20), now: time.Now, hashPassword: passwordHash}
 	stateFile, err := dir.OpenFile(a.filename, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err == nil {
 		defer stateFile.Close()
@@ -128,7 +136,7 @@ func openOAuth(issuer, statePath, rootPath string, readOnly bool, password strin
 			a.close()
 			return nil, statErr
 		}
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 8<<20 {
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > maxOAuthStateBytes {
 			a.close()
 			return nil, errors.New("OAuth 状态必须是权限为 600 的普通文件，且不超过 8 MiB")
 		}
@@ -156,6 +164,21 @@ func openOAuth(issuer, statePath, rootPath string, readOnly bool, password strin
 		a.close()
 		return nil, err
 	}
+	if a.state.Consumed == nil {
+		a.state.Consumed = map[string]oauthToken{}
+	}
+	// 旧版无时间字段，升级时给予完整宽限期并持久化，避免重启重置。
+	if err := a.commitLocked(func() {
+		for id, c := range a.state.Clients {
+			if c.LastUsed.IsZero() {
+				c.LastUsed = a.now()
+				a.state.Clients[id] = c
+			}
+		}
+	}); err != nil {
+		a.close()
+		return nil, err
+	}
 	return a, nil
 }
 
@@ -165,6 +188,9 @@ func (a *oauthServer) saveLocked() error {
 	data, err := json.MarshalIndent(a.state, "", "  ")
 	if err != nil {
 		return err
+	}
+	if len(data) > maxOAuthStateBytes {
+		return errors.New("OAuth 状态超过 8 MiB 限制")
 	}
 	tmp := ".oauth-" + rand.Text()
 	f, err := a.dir.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
@@ -222,6 +248,40 @@ func (a *oauthServer) cleanLocked() {
 	for k, v := range a.state.Tokens {
 		if _, ok := a.state.Grants[v.GrantID]; !ok || !now.Before(v.Expires) {
 			delete(a.state.Tokens, k)
+		}
+	}
+	for k, v := range a.state.Consumed {
+		if _, ok := a.state.Grants[v.GrantID]; !ok || !now.Before(v.Expires) {
+			delete(a.state.Consumed, k)
+		}
+	}
+	protected := map[string]bool{}
+	for _, g := range a.state.Grants {
+		protected[g.ClientID] = true
+	}
+	for _, r := range a.pending {
+		protected[r.ClientID] = true
+	}
+	for _, r := range a.codes {
+		protected[r.ClientID] = true
+	}
+	for id, c := range a.state.Clients {
+		if !protected[id] && !c.LastUsed.IsZero() && !now.Before(c.LastUsed.Add(clientIdleTTL)) {
+			delete(a.state.Clients, id)
+		}
+	}
+}
+
+func (a *oauthServer) revokeGrantLocked(id string) {
+	delete(a.state.Grants, id)
+	for k, t := range a.state.Tokens {
+		if t.GrantID == id {
+			delete(a.state.Tokens, k)
+		}
+	}
+	for k, t := range a.state.Consumed {
+		if t.GrantID == id {
+			delete(a.state.Consumed, k)
 		}
 	}
 }

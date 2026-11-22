@@ -164,8 +164,9 @@ func (p *project) writeLocked(name, content, expected string) (fileOutput, error
 	}
 	defer dir.Close()
 	base := filepath.Base(name)
-	mode := fs.FileMode(0644)
+	mode := fs.FileMode(0600)
 	info, err := dir.Lstat(base)
+	existing := err == nil
 	if err == nil {
 		if !info.Mode().IsRegular() {
 			return fileOutput{}, errors.New("写入目标必须是普通文件，不能是符号链接")
@@ -190,7 +191,7 @@ func (p *project) writeLocked(name, content, expected string) (fileOutput, error
 	}
 	defer dir.Remove(tmp)
 	_, err = f.WriteString(content)
-	if err == nil {
+	if err == nil && existing {
 		err = f.Chmod(mode)
 	}
 	if err == nil {
@@ -222,6 +223,12 @@ func (p *project) edit(name, oldText, newText, expected string, replaceAll bool)
 	if err != nil {
 		return fileOutput{}, err
 	}
+	if p.readOnly {
+		return fileOutput{}, errors.New("服务处于只读模式")
+	}
+	if !utf8.ValidString(oldText) || !utf8.ValidString(newText) || strings.ContainsRune(oldText, 0) || strings.ContainsRune(newText, 0) {
+		return fileOutput{}, errors.New("替换内容必须是 UTF-8 文本")
+	}
 	if oldText == "" {
 		return fileOutput{}, errors.New("old_text 不能为空")
 	}
@@ -229,9 +236,17 @@ func (p *project) edit(name, oldText, newText, expected string, replaceAll bool)
 	if err != nil {
 		return fileOutput{}, err
 	}
+	if expected == "" || hash(data) != expected {
+		return fileOutput{}, errors.New("文件版本不匹配：请重新读取")
+	}
 	count := strings.Count(string(data), oldText)
 	if count == 0 || (count > 1 && !replaceAll) {
 		return fileOutput{}, fmt.Errorf("old_text 匹配 %d 次；必须唯一匹配或设置 replace_all", count)
+	}
+	// 先做除法边界检查，避免乘法溢出或 ReplaceAll 分配巨量内存。
+	base := int64(len(data)) - int64(count)*int64(len(oldText))
+	if base > p.maxBytes || (len(newText) > 0 && int64(count) > (p.maxBytes-base)/int64(len(newText))) {
+		return fileOutput{}, errors.New("替换结果超过文件大小限制")
 	}
 	return p.writeLocked(name, strings.ReplaceAll(string(data), oldText, newText), expected)
 }
@@ -279,36 +294,97 @@ func (p *project) search(ctx context.Context, name, query string, limit int) (se
 	}
 	visited := 0
 	var bytesRead int64
-	err = fs.WalkDir(p.root.FS(), filepath.ToSlash(name), func(path string, d fs.DirEntry, walkErr error) error {
+	var walk func(*os.Root, string, string) error
+	walk = func(root *os.Root, local, path string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		visited++
-		if visited > 20000 || bytesRead >= 32<<20 {
+		if visited >= 20000 || bytesRead >= 32<<20 {
 			out.Truncated = true
 			return fs.SkipAll
 		}
-		if walkErr != nil {
+		visited++
+		info, err := root.Lstat(local)
+		if err != nil {
 			out.Skipped++
-			if path == filepath.ToSlash(name) {
-				return walkErr
+			return err
+		}
+		if info.IsDir() {
+			// 每次只分配一批目录项，不跟随目录符号链接。
+			f, err := root.OpenFile(local, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+			if err != nil {
+				out.Skipped++
+				return err
 			}
-			return nil
+			defer f.Close()
+			// 从已验证且固定的目录句柄建立子 Root，避免再次解析可被替换的路径。
+			child, err := os.OpenRoot(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+			if err != nil {
+				return err
+			}
+			defer child.Close()
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				items, readErr := f.ReadDir(128)
+				for _, item := range items {
+					err := walk(child, item.Name(), filepath.ToSlash(filepath.Join(path, item.Name())))
+					if errors.Is(err, fs.SkipAll) {
+						return err
+					}
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+				}
+				if errors.Is(readErr, io.EOF) {
+					return nil
+				}
+				if readErr != nil {
+					out.Skipped++
+					return readErr
+				}
+			}
 		}
-		if d.IsDir() {
-			return nil
+		if path == filepath.ToSlash(name) && info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("搜索起点不能是符号链接")
 		}
-		if !d.Type().IsRegular() {
+		if !info.Mode().IsRegular() {
 			out.Skipped++
 			return nil
 		}
-		data, err := readText(p.root, filepath.FromSlash(path), p.maxBytes)
+		f, err := root.OpenFile(local, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 		if err != nil {
 			out.Skipped++
 			return nil
 		}
+		defer f.Close()
+		actual, err := f.Stat()
+		if err != nil || !actual.Mode().IsRegular() {
+			out.Skipped++
+			return nil
+		}
+		remaining := int64(32<<20) - bytesRead
+		readLimit := min(p.maxBytes+1, remaining)
+		data, err := io.ReadAll(io.LimitReader(&contextReader{ctx: ctx, r: f}, readLimit))
 		bytesRead += int64(len(data))
-		for i, line := range strings.Split(string(data), "\n") {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil || int64(len(data)) > p.maxBytes || actual.Size() > int64(len(data)) || !utf8.Valid(data) || strings.ContainsRune(string(data), 0) {
+			out.Skipped++
+			if bytesRead >= 32<<20 {
+				out.Truncated = true
+				return fs.SkipAll
+			}
+			return nil
+		}
+		i := 0
+		for line := range strings.SplitSeq(string(data), "\n") {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			i++
 			if strings.Contains(line, query) {
 				if len(out.Matches) >= limit {
 					out.Truncated = true
@@ -322,10 +398,28 @@ func (p *project) search(ctx context.Context, name, query string, limit int) (se
 					}
 					line += "…"
 				}
-				out.Matches = append(out.Matches, match{path, i + 1, line})
+				out.Matches = append(out.Matches, match{path, i, line})
 			}
 		}
 		return nil
-	})
+	}
+	err = walk(p.root, name, filepath.ToSlash(name))
+	if errors.Is(err, fs.SkipAll) {
+		err = nil
+	}
+
 	return out, err
+}
+
+// 每次底层读取前检查取消，及时释放搜索锁。
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }

@@ -97,13 +97,31 @@ export LOCAL_FILES_MCP_PASSWORD
 
 程序仅接受 Google 官方 OAuth 回调域名中 `/r/` 和 `/a/` 下的地址，并在注册后对完整回调 URI 精确匹配。仅填写用户名密码到 Gemini 的高级设置不能代替上述授权流程。
 
+### systemd 部署示例
+
+[服务示例](deploy/local-files-mcp.service)是系统服务，建议使用专用非 root 用户 `local-files-mcp`。先由管理员创建该用户，并给予它项目所需的读写权限和程序目录的读取、执行权限；再准备其拥有的私密目录和必选环境文件：
+
+```bash
+sudo install -d -m 700 -o local-files-mcp -g local-files-mcp /var/lib/local-files-mcp
+sudo install -m 600 -o local-files-mcp -g local-files-mcp /dev/null /var/lib/local-files-mcp/oauth.env
+sudoedit /var/lib/local-files-mcp/oauth.env
+```
+
+首次启动前在文件中填写 `LOCAL_FILES_MCP_PASSWORD="你的至少 12 字节本地授权密码"`，不要复用其他账号口令。环境文件是 systemd 的赋值语法，特殊字符按 systemd 规则引用，不运行 shell 命令。完成首次初始化后可清空密码赋值，但保留这个权限为 `600` 的文件；已有状态不会因此改密码。不要对已有环境文件重复执行上面的 `install /dev/null`，它会清空内容。
+
+按本机路径调整服务的 `WorkingDirectory`、`ExecStart` 和 `EnvironmentFile` 后，将示例安装到 `/etc/systemd/system/`，使用 `sudo systemctl daemon-reload` 和 `sudo systemctl enable --now local-files-mcp`。示例的 `EnvironmentFile=/var/lib/local-files-mcp/oauth.env` 是必选文件，缺失会阻止启动；只有 `EnvironmentFile=-/路径` 才是可选语法，不建议首次部署直接改为可选而遗漏密码初始化。
+
+若使用用户服务，则放入 `~/.config/systemd/user/`，删除 `User`、`Group`，改用当前用户拥有的程序、项目和状态路径，把安装目标改为 `default.target`，使用 `systemctl --user` 管理。系统服务与用户服务的身份、目录权限和环境互不等同。
+
+[nginx 发现端点配置](deploy/nginx-oauth-discovery.conf)仅补充三个元数据路径，仍须另行配置 `/mcp` 和 `/oauth/` 的上游转发；它不能替代完整代理配置。
+
 ### 令牌生命周期
 
 - 授权请求有效期为 5 分钟，授权码有效期为 2 分钟且只能使用一次。
 - 访问令牌有效期为 1 小时，限定当前服务的 `mcp` 权限。
-- 刷新令牌有效期为 90 天，每次刷新延长有效期。机密客户端保留原刷新令牌以兼容 Google 的持久关联；公共客户端采用刷新令牌轮换。
+- 刷新令牌有效期为 90 天，每次刷新延长有效期。机密客户端保留原刷新令牌以兼容 Google 的持久关联；公共客户端采用刷新令牌轮换；重放已消费的旧令牌会撤销整个关联授权。消费哈希最多保存 4096 条，保留至原刷新令牌到期或授权撤销，重启后继续生效。达到记录上限时拒绝新轮换，不淘汰仍有效的记录。
 - 调用撤销接口会同时撤销关联的访问令牌和刷新令牌；在 Gemini 取消关联时可使用这个接口。
-- 密码尝试和动态注册有速率限制；最多保留 256 个客户端、512 个授权和 2048 个未清理令牌。过期授权和令牌在后续 OAuth 操作中清理。
+- 密码尝试和动态注册有速率限制；最多保留 256 个客户端、512 个授权和 2048 个未清理令牌。过期授权和令牌在后续 OAuth 操作中清理。无活动授权、有效待授权请求或未兑换授权码的客户端，闲置 7 天后回收；旧状态升级时给予完整的 7 天宽限期。每个客户端最多有 4 个待授权请求，服务总计最多 128 个；注册和密码限流为服务级，不信任任意 `X-Forwarded-For`。注册元数据按序列化后的实际大小限制为 2 MiB，为授权及令牌预留空间；完整状态读写均不得超过 8 MiB，保存失败会回滚。
 - 重启后保留客户端、授权和令牌。正在进行的登录请求和未交换的授权码不持久化，重启后需要重新连接。
 
 ### 排查连接
@@ -118,7 +136,7 @@ curl -i https://mcp.example.com/mcp
 
 ## 普通客户端的静态 Token
 
-不使用 OAuth 的普通 MCP 客户端可通过环境变量 `LOCAL_FILES_MCP_TOKEN` 启用固定 Bearer Token，并发送 `Authorization: Bearer ...` 请求头。这个模式不能与 OAuth 同时启用，也不等同于 Gemini 的 Client ID 和 Client Secret。不要由公开网关无条件注入固定 Token 后转发所有请求。
+不使用 OAuth 的普通 MCP 客户端可通过环境变量 `LOCAL_FILES_MCP_TOKEN` 启用固定 Bearer Token，并发送 `Authorization: Bearer ...` 请求头。此模式下 `/healthz` 同样要求 Bearer 认证，健康检查需携带请求头。这个模式不能与 OAuth 同时启用，也不等同于 Gemini 的 Client ID 和 Client Secret。不要由公开网关无条件注入固定 Token 后转发所有请求。
 
 ## 可用工具
 
@@ -145,9 +163,9 @@ curl -i https://mcp.example.com/mcp
 
 - 文件操作通过 Go 的 `os.Root` 完成，拒绝绝对路径、`..` 和越界符号链接。读取允许指向目录内的相对符号链接；写入拒绝以符号链接作为最终目标。搜索不跟随符号链接。
 - 单文件默认最大 2 MiB，可用 `-max-file-bytes` 修改，最多 16 MiB。仅支持 UTF-8 文本，拒绝包含 NUL 的二进制内容和 FIFO 等特殊文件。
-- 写入使用同目录临时文件和原子替换，保留原文件的普通权限位；不会沿着已有硬链接原地覆盖其他位置的同一文件。文件所有者、ACL 和扩展属性不保证保留。
+- 写入使用同目录临时文件和原子替换，新文件权限为 `0600`，覆盖时保留原文件的普通权限位；不会沿着已有硬链接原地覆盖其他位置的同一文件。文件所有者、ACL 和扩展属性不保证保留。
 - 同一进程中的工具修改串行执行，过期的 SHA-256 会被拒绝。外部编辑器不受进程锁控制，读取校验与原子替换之间仍可能发生竞争，因此该校验不是跨进程事务。
-- 搜索最多访问 20000 个条目、累计读取约 32 MiB；默认返回 100 个匹配行，最多 1000 行，每行最多展示约 2000 字节。`truncated` 表示提前停止，`skipped` 统计跳过的文件或目录。搜索包含隐藏文件，不解释 `.gitignore`。
+- 搜索最多访问 20000 个条目、累计实际读取最多 32 MiB（包括非文本和超限文件）；默认返回 100 个匹配行，最多 1000 行，每行最多展示约 2000 字节。`truncated` 表示提前停止，`skipped` 统计已遇到但因格式、类型、读取错误或预算不足跳过的文件或目录，不统计尚未遍历的条目。Linux 搜索通过 `/proc/self/fd` 固定已打开的目录句柄，运行环境需提供 procfs。目录以每批 128 个条目读取，不保证排序；取消会停止后续读取并释放搜索锁。搜索包含隐藏文件，不解释 `.gitignore`。
 - 目录限制不是容器隔离：指定目录内已有的挂载点及硬链接仍属于可访问内容。应指定具体项目目录，避免把系统目录作为根目录。
 
 ## 验证
@@ -161,3 +179,17 @@ npx --yes @lint-md/cli --config ".lintmdrc" "README.md"
 ```
 
 测试覆盖目录越界、符号链接、硬链接写入、特殊文件、UTF-8、文件大小限制、并发版本检查，以及 HTTP 上的 MCP 初始化、工具发现和读写流程。OAuth 测试覆盖元数据发现、动态注册、密码与浏览器校验、PKCE、回调地址和资源绑定、授权码防重放、机密与公共客户端刷新、过期、持久化、撤销，以及访问令牌调用文件工具。
+
+浏览器导航回归位于 `scripts/oauth-navigation-smoke.mjs`。先完成上述编译，再通过本机统一 Playwright 工具目录运行；脚本默认从仓库的 `bin/local-files-mcp` 启动合成服务，可用 `OAUTH_SMOKE_BINARY` 指定其他测试构建：
+
+```bash
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/dev/tools/playwright-browsers"
+export PLAYWRIGHT_MODULE="$HOME/dev/tools/playwright-global/node_modules/playwright/index.mjs"
+# 若本机统一工具使用隔离的系统库，沿用其 run.sh 的共享库路径。
+if [ -d "$HOME/dev/tools/playwright-system-deps/root" ]; then
+  export LD_LIBRARY_PATH="$HOME/dev/tools/playwright-system-deps/root/usr/lib/x86_64-linux-gnu:$HOME/dev/tools/playwright-system-deps/root/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+node scripts/oauth-navigation-smoke.mjs
+```
+
+脚本需要 Node.js、openssl 和本机既有 Playwright，不给业务项目安装依赖。它在仓库 `bin` 下创建并清理临时项目、随机口令和授权状态，通过 Chromium 的主机映射将 Google 与 Gemini 的模拟回调导向本地 HTTPS 服务，不使用账号或真实项目。测试只覆盖本机 Chromium 的自动跳转、手动返回、Origin、state 和 PKCE，不代表所有浏览器均兼容。
