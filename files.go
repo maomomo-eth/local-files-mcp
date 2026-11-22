@@ -56,6 +56,10 @@ func readText(root *os.Root, name string, maxBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return readTextFile(f, maxBytes)
+}
+
+func readTextFile(f *os.File, maxBytes int64) ([]byte, error) {
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err

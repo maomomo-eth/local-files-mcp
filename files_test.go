@@ -24,6 +24,9 @@ func testProject(t *testing.T) (*project, string) {
 
 func TestDirectoryBoundary(t *testing.T) {
 	p, dir := testProject(t)
+	if _, err := p.write("inside", "inside", ""); err != nil {
+		t.Fatal(err)
+	}
 	outside := t.TempDir()
 	secret := filepath.Join(outside, "secret.txt")
 	if err := os.WriteFile(secret, []byte("outside"), 0600); err != nil {
@@ -45,6 +48,15 @@ func TestDirectoryBoundary(t *testing.T) {
 			}
 			if err := p.mkdir(name); err == nil {
 				t.Fatal("越界创建目录应失败")
+			}
+			if err := p.deleteFile(name, hash([]byte("outside"))); err == nil {
+				t.Fatal("越界删除应失败")
+			}
+			if _, err := p.moveFile(name, "moved", hash([]byte("outside"))); err == nil {
+				t.Fatal("越界源路径应失败")
+			}
+			if _, err := p.moveFile("inside", name, hash([]byte("inside"))); err == nil {
+				t.Fatal("越界目标路径应失败")
 			}
 		})
 	}

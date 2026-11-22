@@ -36,6 +36,17 @@ type editInput struct {
 	ReplaceAll     bool   `json:"replace_all,omitempty" jsonschema:"是否替换全部匹配，默认要求唯一匹配"`
 }
 
+type deleteInput struct {
+	Path           string `json:"path" jsonschema:"要删除的普通 UTF-8 文件相对路径，禁止根目录 .git 及其内部路径和符号链接"`
+	ExpectedSHA256 string `json:"expected_sha256" jsonschema:"read_file 返回的 sha256"`
+}
+
+type moveInput struct {
+	Source         string `json:"source" jsonschema:"源文件相对路径，必须是普通 UTF-8 文件"`
+	Destination    string `json:"destination" jsonschema:"目标相对路径，必须不存在且父目录已存在；禁止根目录 .git 及其内部路径和符号链接"`
+	ExpectedSHA256 string `json:"expected_sha256" jsonschema:"源文件 read_file 返回的 sha256"`
+}
+
 func tool[I, O any](s *mcp.Server, name, description string, readOnly bool, fn func(context.Context, I) (O, error)) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: name, Description: description,
@@ -67,6 +78,13 @@ func newMCP(p *project) *mcp.Server {
 		tool(s, "create_directory", "Create a directory and missing parents inside the project. 创建目录。", false, func(_ context.Context, in pathInput) (map[string]bool, error) {
 			err := p.mkdir(in.Path)
 			return map[string]bool{"ok": err == nil}, err
+		})
+		tool(s, "delete_file", "删除普通 UTF-8 文件，必须提供 expected_sha256；禁止目录、根目录 .git 及其内部路径和符号链接；子目录 .git 不受保护规则限制。", false, func(_ context.Context, in deleteInput) (map[string]bool, error) {
+			err := p.deleteFile(in.Path, in.ExpectedSHA256)
+			return map[string]bool{"ok": err == nil}, err
+		})
+		tool(s, "move_file", "移动或重命名普通 UTF-8 文件，必须提供源文件 expected_sha256；目标必须不存在，父目录必须已存在；禁止目录、根目录 .git 及其内部路径和符号链接；子目录 .git 不受保护规则限制。", false, func(_ context.Context, in moveInput) (moveOutput, error) {
+			return p.moveFile(in.Source, in.Destination, in.ExpectedSHA256)
 		})
 	}
 	return s

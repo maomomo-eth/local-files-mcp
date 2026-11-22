@@ -44,7 +44,7 @@ func TestMCPHTTPWorkflow(t *testing.T) {
 		}
 	}
 	listed := rpc(t, handler, "tools/list", map[string]any{})
-	if len(listed["tools"].([]any)) != 6 {
+	if len(listed["tools"].([]any)) != 8 {
 		t.Fatalf("工具数量错误：%v", listed)
 	}
 	call := func(name string, args map[string]any) map[string]any {
@@ -70,6 +70,26 @@ func TestMCPHTTPWorkflow(t *testing.T) {
 	search := call("search_files", map[string]any{"query": "再见"})
 	if search["isError"] == true {
 		t.Fatalf("搜索失败：%v", search)
+	}
+	version := hash([]byte("再见\n"))
+	moved := call("move_file", map[string]any{"source": "中文.txt", "destination": "改名.txt", "expected_sha256": version})
+	if moved["isError"] == true || moved["structuredContent"].(map[string]any)["destination"] != "改名.txt" {
+		t.Fatalf("移动失败：%v", moved)
+	}
+	for _, args := range []map[string]any{
+		{"path": "改名.txt"},
+		{"path": ".git", "expected_sha256": version},
+	} {
+		if denied := call("delete_file", args); denied["isError"] != true {
+			t.Fatalf("不安全的删除应失败：%v", denied)
+		}
+	}
+	deleted := call("delete_file", map[string]any{"path": "改名.txt", "expected_sha256": version})
+	if deleted["isError"] == true || deleted["structuredContent"].(map[string]any)["ok"] != true {
+		t.Fatalf("删除失败：%v", deleted)
+	}
+	if missing := call("read_file", map[string]any{"path": "改名.txt"}); missing["isError"] != true {
+		t.Fatal("删除后的文件不应存在")
 	}
 	p.readOnly = true
 	readOnly := newHandler(p, "", nil, "")
