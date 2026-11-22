@@ -1,6 +1,22 @@
+# 编译产物、缓存和日志。
 /bin/
+/.cache/
+*.log
+
+# 本机私密配置应放在仓库外；这些规则防止临时副本误入提交。
 /.private/
 *.env
+.env
+.env.*
+!.env.example
+!*.env.example
 oauth.json
-*.log
-/.cache/
+oauth.json.*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# deploy 中只提交通用示例，本机实例配置不入库。
+/deploy/*.local.*
+/deploy/local-files-mcp-*.service

@@ -21,6 +21,20 @@ go build -buildvcs=false -o bin/local-files-mcp .
 curl http://127.0.0.1:8765/healthz
 ```
 
+## 本机配置与版本管理
+
+开发和提交代码都在同一个 Git 工作目录完成，`deploy/` 仅保存脱敏后的通用部署示例。真实域名、项目路径和本机服务配置放在仓库外：
+
+| 内容 | 路径示例 |
+| --- | --- |
+| 源码、测试和通用部署示例 | `$HOME/dev/go/local-files-mcp/` |
+| 本地授权口令和 OAuth 状态 | `$HOME/dev/.local-files-mcp/my-project/oauth.env`、同目录的 `oauth.json` |
+| 本机 systemd 和 nginx 配置 | `$HOME/dev/.local-files-mcp/my-project/deploy/` |
+
+私密目录权限设为 `700`，其中的口令、状态和本机配置文件设为 `600`。将通用部署示例复制到该目录后再填写本机参数；用户服务可通过软链接引用仓库外的配置，修改引用后执行 `systemctl --user daemon-reload`。具体运行身份和初始化步骤见下方 systemd 部署说明。
+
+`.gitignore` 排除构建产物、环境文件、OAuth 状态、私钥以及本机部署副本。它不会取消已经跟踪的文件；提交前使用 `git status --short` 和 `git diff --cached --name-only` 核对范围，避免强制加入私密配置。
+
 ## 通过 gost 接入 Gemini
 
 将服务器上的 HTTPS 地址转发到运行本程序的机器的 `127.0.0.1:8765`，保留请求路径和请求头。在 Gemini 的 Add a custom app 中填写：
