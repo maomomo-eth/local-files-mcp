@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -88,8 +89,8 @@ func (f *oauthFixture) loginPage(t *testing.T) (string, *http.Cookie) {
 	if w.Header().Get("Referrer-Policy") != "same-origin" {
 		t.Fatal("授权页必须保留同源表单的 Origin")
 	}
-	if !strings.Contains(w.Header().Get("Content-Security-Policy"), "form-action 'self' https://oauth-redirect.googleusercontent.com;") {
-		t.Fatal("表单策略必须允许跳回已校验的 Google OAuth 回调源")
+	if !strings.Contains(w.Header().Get("Content-Security-Policy"), "form-action 'self';") {
+		t.Fatal("密码表单应仅允许提交本站")
 	}
 	match := regexp.MustCompile(`name="request_id" value="([^"]+)"`).FindStringSubmatch(w.Body.String())
 	if len(match) != 2 || len(w.Result().Cookies()) != 1 {
@@ -103,17 +104,30 @@ func (f *oauthFixture) authorizeCode(t *testing.T) string {
 	id, cookie := f.loginPage(t)
 	form := url.Values{"request_id": {id}, "password": {testPassword}, "decision": {"allow"}}
 	w := f.request("POST", "/oauth/authorize", form.Encode(), "application/x-www-form-urlencoded", cookie)
-	if w.Code != 303 {
+	if w.Code != 200 {
 		t.Fatalf("授权失败：%d %s", w.Code, w.Body.String())
 	}
-	u, err := url.Parse(w.Header().Get("Location"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	u := returnURL(t, w)
 	if u.Host != "oauth-redirect.googleusercontent.com" || u.Query().Get("state") != "保持-state-123" || u.Query().Get("code") == "" {
 		t.Fatal("授权回调错误")
 	}
 	return u.Query().Get("code")
+}
+
+func returnURL(t *testing.T, w *httptest.ResponseRecorder) *url.URL {
+	t.Helper()
+	match := regexp.MustCompile(`id="return-link" href="([^"]+)"`).FindStringSubmatch(w.Body.String())
+	if len(match) != 2 || !strings.Contains(w.Body.String(), `http-equiv="refresh"`) {
+		t.Fatal("结果页必须包含自动跳转和手动返回入口")
+	}
+	u, err := url.Parse(html.UnescapeString(match[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Header().Get("Referrer-Policy") != "no-referrer" || w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("结果页必须避免缓存和发送 Referer")
+	}
+	return u
 }
 
 func (f *oauthFixture) tokenRequest(values url.Values, path string) *httptest.ResponseRecorder {
@@ -253,7 +267,7 @@ func TestOAuthConsentOrigin(t *testing.T) {
 	for _, tc := range []struct {
 		origin string
 		status int
-	}{{"null", 403}, {"https://attacker.example", 403}, {testIssuer, 303}} {
+	}{{"null", 403}, {"https://attacker.example", 403}, {testIssuer, 200}} {
 		r := httptest.NewRequest("POST", testIssuer+"/oauth/authorize", strings.NewReader(form.Encode()))
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		r.Header.Set("Origin", tc.origin)
@@ -336,7 +350,7 @@ func TestOAuthCodeExpiryDenialAndSaveFailure(t *testing.T) {
 	id, cookie := f.loginPage(t)
 	deny := url.Values{"request_id": {id}, "decision": {"deny"}}
 	w := f.request("POST", "/oauth/authorize", deny.Encode(), "application/x-www-form-urlencoded", cookie)
-	if w.Code != 303 || !strings.Contains(w.Header().Get("Location"), "error=access_denied") {
+	if w.Code != 200 || returnURL(t, w).Query().Get("error") != "access_denied" {
 		t.Fatal("取消授权不应签发授权码")
 	}
 	code := f.authorizeCode(t)

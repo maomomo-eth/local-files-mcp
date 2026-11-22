@@ -162,6 +162,13 @@ var consentPage = template.Must(template.New("consent").Parse(`<!doctype html>
 <label>本地服务授权密码<input type="password" name="password" autocomplete="current-password" maxlength="1024" required></label>
 <button type="submit" name="decision" value="allow">确认授权</button> <button type="submit" name="decision" value="deny" formnovalidate>取消</button></form></html>`))
 
+var returnPage = template.Must(template.New("return").Parse(`<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="0; url={{.URL}}"><title>{{.Title}}</title>
+<style>body{font:17px system-ui;max-width:640px;margin:60px auto;padding:24px;line-height:1.7}a{display:inline-block;padding:12px 18px;background:#174ea6;color:white;border-radius:6px;text-decoration:none}</style></head>
+<body><h1>{{.Title}}</h1><p>正在返回 Gemini。如果浏览器未自动跳转，请点击下面的按钮。</p>
+<a id="return-link" href="{{.URL}}" rel="noreferrer">继续返回 Gemini</a></body></html>`))
+
 func (a *oauthServer) authorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	for _, v := range q {
@@ -201,9 +208,8 @@ func (a *oauthServer) authorize(w http.ResponseWriter, r *http.Request) {
 	// 表单导航在 no-referrer 下会发送 Origin:null；保留同源信息供提交时校验。
 	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// 浏览器也会对表单的重定向执行 form-action 检查，允许已校验的 Google 回调源。
-	callback, _ := url.Parse(q.Get("redirect_uri"))
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://"+callback.Host+"; frame-ancestors 'none'; base-uri 'none'")
+	// 表单只提交本站；成功后先提交独立结果页，再开始 Google 的连续导航。
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.SetCookie(w, &http.Cookie{Name: "__Host-local-files-oauth", Value: cookie, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 300})
 	_ = consentPage.Execute(w, map[string]any{"Name": c.Name, "Redirect": q.Get("redirect_uri"), "Action": a.state.Issuer + "/oauth/authorize", "ReadOnly": a.state.ReadOnly, "ID": id})
@@ -240,7 +246,7 @@ func (a *oauthServer) consent(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.PostForm.Get("decision") == "deny" {
 		delete(a.pending, id)
-		a.redirect(w, r, req, "error", "access_denied")
+		a.returnToClient(w, req, "error", "access_denied")
 		return
 	}
 	if r.PostForm.Get("decision") != "allow" {
@@ -266,9 +272,9 @@ func (a *oauthServer) consent(w http.ResponseWriter, r *http.Request) {
 	req.Expires = a.now().Add(2 * time.Minute)
 	a.codes[hash([]byte(code))] = req
 	http.SetCookie(w, &http.Cookie{Name: "__Host-local-files-oauth", Value: "", Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
-	a.redirect(w, r, req, "code", code)
+	a.returnToClient(w, req, "code", code)
 }
-func (a *oauthServer) redirect(w http.ResponseWriter, r *http.Request, req oauthRequest, key, value string) {
+func (a *oauthServer) returnToClient(w http.ResponseWriter, req oauthRequest, key, value string) {
 	u, _ := url.Parse(req.Redirect)
 	q := u.Query()
 	q.Set(key, value)
@@ -277,8 +283,18 @@ func (a *oauthServer) redirect(w http.ResponseWriter, r *http.Request, req oauth
 	}
 	u.RawQuery = q.Encode()
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	http.Redirect(w, r, u.String(), http.StatusSeeOther)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	title := "授权成功"
+	if key == "error" {
+		title = "已取消授权"
+	}
+	// 先提交 HTTP 200 的新文档，让后续跨站导航脱离原表单的 CSP 约束。
+	// URL 来自已校验的已注册回调，不接收独立的外部跳转参数。
+	_ = returnPage.Execute(w, map[string]string{"URL": u.String(), "Title": title})
 }
 
 func (a *oauthServer) validResource(resource string) bool {

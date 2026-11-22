@@ -93,7 +93,7 @@ export LOCAL_FILES_MCP_PASSWORD
 1. 打开 Add a custom app，填写 `https://mcp.example.com/mcp`。
 2. 使用动态客户端注册，Client ID 和 Client Secret 无需手填，由 Gemini 自动获取。
 3. 打开的授权页会显示客户端声明名称、权限和 Google 回调地址。输入首次设置的本地授权密码，点击确认授权。
-4. 跳回 Gemini 后保存应用，使用 `@应用名` 调用工具。
+4. 授权成功或取消后，结果页会自动导航回 Gemini；若浏览器没有自动跳转，点击“继续返回 Gemini”链接。返回后保存应用，使用 `@应用名` 调用工具。
 
 程序仅接受 Google 官方 OAuth 回调域名中 `/r/` 和 `/a/` 下的地址，并在注册后对完整回调 URI 精确匹配。仅填写用户名密码到 Gemini 的高级设置不能代替上述授权流程。
 
