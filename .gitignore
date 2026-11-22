@@ -1,0 +1,6 @@
+/bin/
+/.private/
+*.env
+oauth.json
+*.log
+/.cache/
